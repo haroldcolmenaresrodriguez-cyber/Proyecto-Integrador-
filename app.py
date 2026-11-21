@@ -12,41 +12,63 @@ st.title("Monitor de Riesgo Bursátil: Choques Externos sobre Ecopetrol ADR")
 st.markdown("**Equipo:** Los Endeudados | **Activo Proxy:** Ecopetrol ADR (`EC` - NYSE) | **Periodo:** 2019–2021")
 
 
+def limpiar_numero_serie(serie):
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce")
+
+    s = (
+        serie.astype(str)
+        .str.replace("\u00a0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.strip()
+    )
+    ambos = s.str.contains(r"\.", regex=True) & s.str.contains(",", regex=True)
+    s.loc[ambos] = (
+        s.loc[ambos]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    solo_coma = ~ambos & s.str.contains(",", regex=True)
+    s.loc[solo_coma] = s.loc[solo_coma].str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
 @st.cache_data
 def cargar_datos():
     ruta = "base_precios_depurada_2019_2021_LosEndeudados_v2.csv"
     df = pd.read_csv(ruta, sep=None, engine="python")
-    df["Fecha"] = pd.to_datetime(df["Fecha"], format="mixed", dayfirst=True, errors="coerce")
-    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").set_index("Fecha")
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+
+    col_fecha = next((c for c in df.columns if c.lower() in ["fecha", "date"]), df.columns[0])
+    df[col_fecha] = pd.to_datetime(df[col_fecha], format="mixed", dayfirst=True, errors="coerce")
+    df = df.dropna(subset=[col_fecha]).sort_values(col_fecha).set_index(col_fecha)
 
     cols_precios = ["EC_ADR_USD_Cierre", "Brent_USD_Cierre", "USD_COP_Cierre"]
-    precios = df[cols_precios].copy()
+    faltantes = [c for c in cols_precios if c not in df.columns]
+    if faltantes:
+        return pd.DataFrame(), pd.DataFrame(), faltantes, list(df.columns), df.head(3)
 
+    precios = pd.DataFrame(index=df.index)
     for c in cols_precios:
-        if precios[c].dtype == "object":
-            s = precios[c].astype(str).str.strip().str.replace(" ", "", regex=False)
-            mask_ambos = s.str.contains(r"\.", regex=True) & s.str.contains(",", regex=True)
-            s.loc[mask_ambos] = (
-                s.loc[mask_ambos]
-                .str.replace(".", "", regex=False)
-                .str.replace(",", ".", regex=False)
-            )
-            mask_coma = ~mask_ambos & s.str.contains(",", regex=True)
-            s.loc[mask_coma] = s.loc[mask_coma].str.replace(",", ".", regex=False)
-            precios[c] = pd.to_numeric(s, errors="coerce")
-        else:
-            precios[c] = pd.to_numeric(precios[c], errors="coerce")
+        precios[c] = limpiar_numero_serie(df[c])
 
     precios = precios.dropna()
-    rendimientos = 100 * np.log(precios / precios.shift(1)).dropna()
+    if len(precios) < 2:
+        return precios, pd.DataFrame(), [], list(df.columns), df.head(3)
+
+    rendimientos = 100.0 * np.log(precios / precios.shift(1)).dropna()
     rendimientos.columns = ["EC_ADR_ret", "Brent_ret", "USD_COP_ret"]
-    return precios, rendimientos
+    return precios, rendimientos, [], list(df.columns), precios.head(3)
 
 
-precios, rendimientos = cargar_datos()
+precios, rendimientos, cols_faltantes, cols_csv, muestra = cargar_datos()
 
 if rendimientos.empty:
-    st.error("No se pudieron calcular rendimientos válidos. Revisa los nombres de columnas o el formato numérico del CSV.")
+    st.error("No se pudieron calcular rendimientos válidos desde el CSV.")
+    if cols_faltantes:
+        st.warning(f"Columnas esperadas no encontradas: {cols_faltantes}")
+    st.write("Columnas detectadas en el CSV:", cols_csv)
+    st.dataframe(muestra)
     st.stop()
 
 st.sidebar.header("Parámetros del Monitor")
@@ -62,7 +84,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "4. Simulación Monte Carlo (COP)"
 ])
 
-# --- PESTAÑA 1: DATOS Y ADF ---
 with tab1:
     st.subheader("Exploración de Precios y Rendimientos Logarítmicos (%)")
     vista = st.radio("Seleccionar serie a graficar:", ["Rendimientos Logarítmicos (%)", "Precios de Cierre"], horizontal=True)
@@ -91,7 +112,6 @@ with tab1:
         })
     st.dataframe(pd.DataFrame(adf_lista).set_index("Variable"))
 
-# --- PESTAÑA 2: MODELO VAR ---
 with tab2:
     st.subheader(f"Estimación del Modelo Vector Autorregresivo - VAR({rezagos_var})")
     modelo = VAR(rendimientos[["EC_ADR_ret", "Brent_ret", "USD_COP_ret"]])
@@ -110,11 +130,11 @@ with tab2:
     irf = res_var.irf(10)
     fig_irf = irf.plot(orth=True)
     st.pyplot(fig_irf)
+    plt.close(fig_irf)
 
     with st.expander("Ver Resumen Estadístico Completo del VAR"):
         st.text(res_var.summary())
 
-# --- CÁLCULOS DE MARKOV (COMPARTIDOS ENTRE PESTAÑA 3 Y 4) ---
 serie_ec = rendimientos["EC_ADR_ret"]
 limite_inferior = float(serie_ec.quantile(1 / 3))
 limite_superior = float(serie_ec.quantile(2 / 3))
@@ -139,7 +159,6 @@ transiciones = pd.crosstab(
 matriz_markov = transiciones.div(transiciones.sum(axis=1), axis=0)
 P = matriz_markov.to_numpy()
 
-# --- PESTAÑA 3: MARKOV ---
 with tab3:
     st.subheader("Cadenas de Markov y Regímenes de Mercado")
 
@@ -183,8 +202,8 @@ with tab3:
                 )
         plt.tight_layout()
         st.pyplot(fig_mk)
+        plt.close(fig_mk)
 
-# --- PESTAÑA 4: MONTE CARLO (MARKOV-SWITCHING HISTORICAL BOOTSTRAP) ---
 with tab4:
     st.subheader("Simulación Monte Carlo: Markov-Switching Historical Bootstrap")
 
@@ -209,7 +228,7 @@ with tab4:
         suma_portafolio = 0.0
         secuencia_sim = [estado_actual]
 
-        for dia in range(HORIZONTE):
+        for _ in range(HORIZONTE):
             estado_siguiente = rng.choice(len(orden_estados), p=P[estado_actual])
             nombre_estado = orden_estados[estado_siguiente]
 
@@ -252,7 +271,7 @@ with tab4:
 
     var_95, es_95 = calcular_riesgo(perdidas, 0.95)
     var_99, es_99 = calcular_riesgo(perdidas, 0.99)
-    reserva_recomendada = max(0, es_99)
+    reserva_recomendada = max(0.0, es_99)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("VaR 95%", f"${var_95:,.0f} COP")
@@ -269,7 +288,7 @@ with tab4:
             "Indicador": ["VaR 95%", "Expected Shortfall 95%", "VaR 99%", "Expected Shortfall 99%"],
             "Valor_COP": [f"${var_95:,.0f}", f"${es_95:,.0f}", f"${var_99:,.0f}", f"${es_99:,.0f}"]
         })
-        st.dataframe(tabla_riesgo.set_index("Indicador"), use_container_width=True)
+        st.dataframe(tabla_riesgo.set_index("Indicador"), width="stretch")
 
     with col_t2:
         st.markdown("**Resumen General de la Simulación**")
@@ -293,7 +312,7 @@ with tab4:
                 f"{(perdidas > 0).mean() * 100:.2f}%"
             ]
         })
-        st.dataframe(resumen.set_index("Indicador"), use_container_width=True)
+        st.dataframe(resumen.set_index("Indicador"), width="stretch")
 
     st.markdown("**Distribución Simulada de Pérdidas en COP**")
     fig_hist, ax_h = plt.subplots(figsize=(10, 4.5))
@@ -308,6 +327,7 @@ with tab4:
     ax_h.grid(alpha=0.25)
     plt.tight_layout()
     st.pyplot(fig_hist)
+    plt.close(fig_hist)
 
     with st.expander("🔍 Auditoría de Trazabilidad de Estados en Escenarios Extremos"):
         st.markdown("Muestra cuántos días transcurrieron en cada régimen de Markov dentro de las 5 trayectorias de mayor pérdida.")
@@ -325,4 +345,4 @@ with tab4:
                 "Días en Favorable": conteo_estados["Favorable"],
                 "Log-Retorno Portafolio (%)": f"{resultados_mc.loc[idx, 'Log_Ret_Portafolio_COP_pct']:.2f}%"
             })
-        st.dataframe(pd.DataFrame(auditoria_extremos).set_index("Simulación"), use_container_width=True)
+        st.dataframe(pd.DataFrame(auditoria_extremos).set_index("Simulación"), width="stretch")
