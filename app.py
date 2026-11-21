@@ -24,7 +24,9 @@ def cargar_datos():
             precios[c] = pd.to_numeric(s, errors="coerce")
         else:
             precios[c] = pd.to_numeric(precios[c], errors="coerce")
-
+if rendimientos.empty:
+    st.error("No se pudieron calcular rendimientos válidos. Revisa los nombres de columnas o el formato numérico del CSV.")
+    st.stop()
     precios = precios.dropna()
     rendimientos = 100 * np.log(precios / precios.shift(1)).dropna()
     rendimientos.columns = ["EC_ADR_ret", "Brent_ret", "USD_COP_ret"]
