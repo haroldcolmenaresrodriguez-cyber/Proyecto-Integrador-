@@ -22,16 +22,24 @@ def limpiar_numero_serie(serie):
         .str.replace(" ", "", regex=False)
         .str.strip()
     )
+
+    # Caso 1: tiene punto y coma (ej. 1.234,56) -> quitar puntos de miles y cambiar coma por punto
     ambos = s.str.contains(r"\.", regex=True) & s.str.contains(",", regex=True)
     s.loc[ambos] = (
         s.loc[ambos]
         .str.replace(".", "", regex=False)
         .str.replace(",", ".", regex=False)
     )
+
+    # Caso 2: solo tiene coma (ej. 164,6 o 1234,56) -> cambiar coma por punto
     solo_coma = ~ambos & s.str.contains(",", regex=True)
     s.loc[solo_coma] = s.loc[solo_coma].str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
 
+    # Caso 3: solo tiene puntos y sin coma (ej. 32.450.000) -> quitar puntos de miles
+    solo_punto = ~ambos & ~solo_coma & s.str.contains(r"\.", regex=True)
+    s.loc[solo_punto] = s.loc[solo_punto].str.replace(".", "", regex=False)
+
+    return pd.to_numeric(s, errors="coerce")
 
 @st.cache_data
 def cargar_datos():
