@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.stattools import adfuller
-from scipy.stats import kurtosis
+from scipy.stats import kurtosis, chi2_contingency
 
 st.set_page_config(page_title="Monitor de Riesgo Bursátil - Los Endeudados", layout="wide")
 
@@ -85,12 +85,42 @@ CAPITAL_INICIAL = st.sidebar.number_input("Capital Inicial (COP):", min_value=1_
 HORIZONTE = st.sidebar.selectbox("Horizonte de simulación (días):", [21, 63, 252], index=0)
 N_SIMULACIONES = st.sidebar.selectbox("Número de simulaciones:", [5000, 10000, 20000], index=1)
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Inicio",
     "1. Datos y Estacionariedad",
     "2. Modelo VAR",
     "3. Cadenas de Markov",
-    "4. Simulación Monte Carlo (COP)"
+    "4. Simulación Monte Carlo (COP)",
+    "5. Conclusiones"
 ])
+
+with tab0:
+    st.subheader("Problema, pregunta, usuario y decisión")
+    st.markdown(
+        "**Problema.** El ADR de Ecopetrol cotiza en dólares en la Bolsa de Nueva York y depende del precio "
+        "del petróleo, pero un inversionista colombiano mide su riqueza en pesos. Entre 2019 y 2021, y sobre "
+        "todo en marzo de 2020, el activo, el Brent y la tasa de cambio tuvieron movimientos extremos. Las "
+        "correlaciones del mismo día no muestran si un choque del petróleo o del dólar anticipa los rendimientos "
+        "de los días siguientes, cuánto dura una fase adversa ni qué pérdida en pesos puede ocurrir en un mes."
+    )
+    st.markdown(
+        "**Pregunta central.** ¿Cómo se transmiten los choques del Brent y de la tasa de cambio USD/COP sobre "
+        "los rendimientos de Ecopetrol ADR entre 2019 y 2021, con qué probabilidad transita el activo entre "
+        "regímenes adverso, neutral y favorable, y qué pérdida extrema en pesos enfrentaría una inversión a "
+        "21 días hábiles?"
+    )
+    c_u, c_d = st.columns(2)
+    c_u.info("**Usuario:** analista de riesgo de un portafolio en pesos con posición en Ecopetrol ADR.")
+    c_d.success("**Decisión:** asignar una reserva de liquidez igual al Expected Shortfall al 99 % de la pérdida simulada.")
+    st.markdown("**Flujo del análisis:** Datos diarios → VAR (transmisión de choques) → Estados de Markov → "
+                "Simulación Monte Carlo en pesos → Reserva propuesta.")
+    st.markdown(
+        "**Datos.** Precios de cierre diarios de Ecopetrol ADR (EC, USD por acción), petróleo Brent (BZ=F, USD por "
+        "barril) y tasa de cambio (COP=X, COP por USD), descargados de Yahoo Finance con la librería `yfinance` "
+        "(ver `PROYECTO.ipynb`). Periodo común: 2 de enero de 2019 a 30 de diciembre de 2021; "
+        f"{len(precios)} precios y {len(rendimientos)} rendimientos logarítmicos por serie, sin datos faltantes."
+    )
+    st.caption("Use la barra lateral para cambiar los rezagos del VAR, el capital, el horizonte y el número de simulaciones.")
 
 with tab1:
     st.subheader("Exploración de Precios y Rendimientos Logarítmicos (%)")
@@ -139,6 +169,23 @@ with tab2:
     fig_irf = irf.plot(orth=True)
     st.pyplot(fig_irf)
     plt.close(fig_irf)
+
+    st.markdown("**Pronóstico del VAR a 10 días (rendimientos logarítmicos, %)**")
+    try:
+        datos_var = rendimientos[["EC_ADR_ret", "Brent_ret", "USD_COP_ret"]].to_numpy()
+        punto, inferior, superior = res_var.forecast_interval(datos_var[-res_var.k_ar:], steps=10, alpha=0.05)
+        pronostico = pd.DataFrame({
+            "EC pronóstico": punto[:, 0],
+            "EC límite inferior 95%": inferior[:, 0],
+            "EC límite superior 95%": superior[:, 0],
+            "Brent pronóstico": punto[:, 1],
+            "USD/COP pronóstico": punto[:, 2],
+        }, index=pd.RangeIndex(1, 11, name="Día"))
+        st.dataframe(pronostico.round(4))
+        st.caption("El pronóstico puntual converge rápido a la media histórica (cercana a cero) y el intervalo es amplio: "
+                   "el VAR sirve más para medir la transmisión de choques que para predecir el nivel del rendimiento.")
+    except Exception as e:
+        st.warning(f"No fue posible calcular el pronóstico: {e}")
 
     with st.expander("Ver Resumen Estadístico Completo del VAR"):
         st.text(res_var.summary())
@@ -354,3 +401,51 @@ with tab4:
                 "Log-Retorno Portafolio (%)": f"{resultados_mc.loc[idx, 'Log_Ret_Portafolio_COP_pct']:.2f}%"
             })
         st.dataframe(pd.DataFrame(auditoria_extremos).set_index("Simulación"), width="stretch")
+
+with tab5:
+    st.subheader("Hallazgos, límites, decisión y bibliografía")
+
+    p_brent = res_var.test_causality(caused="EC_ADR_ret", causing=["Brent_ret"], kind="f").pvalue
+    p_cop = res_var.test_causality(caused="EC_ADR_ret", causing=["USD_COP_ret"], kind="f").pvalue
+    chi2_est, p_indep, gl, _ = chi2_contingency(transiciones.to_numpy())
+
+    st.markdown("**Hallazgos**")
+    st.markdown(
+        f"- **VAR({rezagos_var}):** el Brent y la tasa de cambio ayudan a predecir los rendimientos de EC "
+        f"(causalidad de Granger, valor p = {p_brent:.4f} y {p_cop:.4f}). La correlación contemporánea entre EC y "
+        f"Brent es {rendimientos['EC_ADR_ret'].corr(rendimientos['Brent_ret']):.3f}.\n"
+        f"- **Markov:** los regímenes duran en promedio entre {min(duracion.values()):.2f} y {max(duracion.values()):.2f} días, "
+        f"y la prueba chi cuadrado no rechaza la independencia entre estados consecutivos "
+        f"(χ²({gl}) = {chi2_est:.2f}; valor p = {p_indep:.3f}).\n"
+        f"- **Monte Carlo:** para {CAPITAL_INICIAL:,.0f} COP a {HORIZONTE} días, la probabilidad de pérdida es "
+        f"{(perdidas > 0).mean() * 100:.2f} %, el VaR 95 % es {var_95:,.0f} COP y el VaR 99 % es {var_99:,.0f} COP."
+    )
+    st.success(
+        f"**Decisión:** mantener una reserva de liquidez de {reserva_recomendada:,.0f} COP "
+        f"(Expected Shortfall al 99 %, {reserva_recomendada / CAPITAL_INICIAL * 100:.1f} % del capital), "
+        "tomada como mínimo y recalculada con datos recientes."
+    )
+
+    st.markdown("**Límites**")
+    st.markdown(
+        "- Los residuos del VAR no son normales y las funciones de impulso-respuesta dependen del orden de Cholesky "
+        "(EC, Brent, USD/COP); se interpretan como dinámica predictiva, no como efectos causales estructurales.\n"
+        "- La cadena de Markov casi no tiene memoria, así que la simulación no reproduce bien las rachas de días "
+        "malos como las de marzo de 2020 y puede subestimar la cola extrema.\n"
+        "- La muestra está dominada por el choque de la pandemia; el portafolio no incluye costos ni dividendos."
+    )
+
+    st.markdown("**Fuentes y bibliografía**")
+    st.markdown(
+        "- Yahoo Finance. (s. f.). Datos históricos de EC, BZ=F y COP=X. https://finance.yahoo.com/\n"
+        "- Melo, L. F., & Hamann, F. A. (1998). *Inflación básica: Una estimación basada en modelos VAR estructurales* "
+        "(Borradores de Economía No. 93). Banco de la República. https://doi.org/10.32468/be.93\n"
+        "- Rosas Rosas, L. del C., & Segundo Rosas, J. I. (2019). Sobre cadenas de Markov y su potencial en las "
+        "aplicaciones. *Epistemus, 13*(26), 7–12. https://doi.org/10.36790/epistemus.v13i26.90\n"
+        "- Romero, P., & Rueda, R. (2013). Ars Conjectandi y el método Monte Carlo. *Revista Digital Universitaria, "
+        "14*(11). https://www.revista.unam.mx/vol.14/num11/art44/\n"
+        "- Hyndman, R. J., & Athanasopoulos, G. (2021). *Forecasting: Principles and practice* (3.ª ed.). OTexts. "
+        "https://otexts.com/fpp3/\n"
+        "- Seabold, S., & Perktold, J. (2010). Statsmodels: Econometric and statistical modeling with Python. "
+        "*Proceedings of the 9th Python in Science Conference*, 92–96."
+    )
